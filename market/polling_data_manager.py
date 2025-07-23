@@ -1,10 +1,11 @@
-# delta_hedger/market/state.py
+# delta_hedger/market/polling_data_manager.py
 
 import asyncio
 import time
 import logging
-from clients.user_agent_mixin import OptionDataStreamSigned, StockDataStreamSigned
-from .connection_manager import ConnectionManager
+from typing import Optional
+from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest
 from config import (
     API_KEY, API_SECRET, HEDGING_ASSET,
     PRICE_CHANGE_THRESHOLD, HEARTBEAT_TRIGGER_SECONDS
@@ -14,38 +15,31 @@ from .us_treasury_yield_curve import get_risk_free_rate
 from .dividends import get_dividend_yield
 from datetime import datetime
 
-# Configure logging for this module
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
-class MarketDataManager:
+class PollingMarketDataManager:
     """
-    Acts as the market sensing organ of the trading bot.
-
-    This class is responsible for:
-    - Subscribing to real-time stock and option quote data from Alpaca.
-    - Maintaining the current, most up-to-date prices for the underlying asset
-      and the two option contracts that form our straddle.
-    - Implementing a filtering mechanism for stock quotes to discard potentially
-      erroneous data points caused by wide bid-ask spreads.
-    - Determining when to trigger a portfolio delta recalculation. This is a
-      critical function to ensure the system is responsive but not hyperactive.
-      Triggers are sent to the DeltaEngine via a dedicated asyncio.Queue.
+    A market data manager that uses polling instead of websocket streaming.
+    
+    This avoids connection limit issues with Alpaca's paper trading environment
+    by making periodic API calls to get the latest quotes instead of maintaining
+    persistent websocket connections.
     """
 
-    def __init__(self, trigger_queue: asyncio.Queue, call_option_symbol: str, put_option_symbol: str):
+    def __init__(self, trigger_queue: asyncio.Queue, call_option_symbol: str, put_option_symbol: str, hedging_asset: Optional[str] = None):
         """
-        Initializes the MarketDataManager.
+        Initializes the PollingMarketDataManager.
 
         Args:
             trigger_queue: An asyncio.Queue used to send trigger signals to the DeltaEngine.
             call_option_symbol: The symbol for the call option of the straddle.
             put_option_symbol: The symbol for the put option of the straddle.
+            hedging_asset: The ticker symbol for the underlying asset (defaults to config value).
         """
         self.trigger_queue = trigger_queue
         self.call_option_symbol = call_option_symbol
         self.put_option_symbol = put_option_symbol
+        self.hedging_asset = hedging_asset or HEDGING_ASSET
 
         # Parse option symbols to extract expiry and strike, which are needed for pricing.
         _, _, self.call_option_expiry, self.call_option_strike = parse_option_symbol(call_option_symbol)
@@ -76,13 +70,13 @@ class MarketDataManager:
         if not API_KEY or not API_SECRET:
             raise ValueError("API_KEY and API_SECRET must be set in environment variables")
         
-        # Use two separate streams but implement connection management to prevent multiple concurrent connections
-        # Options and stocks require different data endpoints in Alpaca
-        self.option_stream = OptionDataStreamSigned(API_KEY, API_SECRET)
-        self.stock_stream = StockDataStreamSigned(API_KEY, API_SECRET)
+        # Create historical data clients for polling
+        self.stock_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        self.option_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
         
-        # Connection manager to handle rate limiting and prevent duplicate connections
-        self.connection_manager = ConnectionManager()
+        # Polling configuration
+        self.poll_interval = 1.0  # Poll every 1 second
+        self._running = False
 
     async def _check_and_trigger(self):
         """
@@ -136,14 +130,38 @@ class MarketDataManager:
             # and we're dropping this trigger in favor of a future one.
             pass
 
+    async def _poll_stock_data(self):
+        """Poll for latest stock quote data."""
+        try:
+            request = StockLatestQuoteRequest(symbol_or_symbols=[self.hedging_asset])
+            quotes = self.stock_client.get_stock_latest_quote(request)
+            
+            if self.hedging_asset in quotes:
+                quote = quotes[self.hedging_asset]
+                await self._handle_stock_quote(quote)
+        except Exception as e:
+            logger.warning(f"Error polling stock data: {e}")
+
+    async def _poll_option_data(self):
+        """Poll for latest option quote data."""
+        try:
+            request = OptionLatestQuoteRequest(
+                symbol_or_symbols=[self.call_option_symbol, self.put_option_symbol]
+            )
+            quotes = self.option_client.get_option_latest_quote(request)
+            
+            for symbol, quote in quotes.items():
+                await self._handle_option_quote_data(symbol, quote)
+        except Exception as e:
+            logger.warning(f"Error polling option data: {e}")
+
     async def _handle_stock_quote(self, quote):
         """
-        Callback function for processing incoming stock quotes.
-
-        It calculates the mid-price and applies a spread-based filter to ensure
-        data quality before updating the official state and checking for triggers.
-        An EMA of the spread is maintained to adapt to changing market conditions.
+        Process stock quote data.
         """
+        if not hasattr(quote, 'ask_price') or not hasattr(quote, 'bid_price'):
+            return
+            
         spread = quote.ask_price - quote.bid_price
         mid_price = (quote.bid_price + quote.ask_price) / 2
 
@@ -161,52 +179,42 @@ class MarketDataManager:
             # Standard EMA formula
             self._spread_ema = 0.9 * self._spread_ema + 0.1 * spread
 
-    async def _handle_option_quote(self, quote):
+    async def _handle_option_quote_data(self, symbol: str, quote):
         """
-        Callback function for processing incoming option quotes.
-
-        Updates the respective option's price (call or put). No spread filter
-        is applied here, as option spreads are naturally wider and more volatile.
+        Process option quote data.
         """
+        if not hasattr(quote, 'ask_price') or not hasattr(quote, 'bid_price'):
+            return
+            
         mid_price = (quote.bid_price + quote.ask_price) / 2
         if mid_price > 0:
-            if quote.symbol == self.call_option_symbol:
+            if symbol == self.call_option_symbol:
                 self.call_option_price = mid_price
-            elif quote.symbol == self.put_option_symbol:
+            elif symbol == self.put_option_symbol:
                 self.put_option_price = mid_price
 
-    def subscribe_to_streams(self):
-        """Subscribes the appropriate handler functions to the respective data streams."""
-        # Subscribe to option quotes using the option stream
-        self.option_stream.subscribe_quotes(self._handle_option_quote, self.call_option_symbol, self.put_option_symbol)
-        # Subscribe to stock quotes using the stock stream
-        self.stock_stream.subscribe_quotes(self._handle_stock_quote, HEDGING_ASSET)
-        logger.info(f"Subscribed to stock ({HEDGING_ASSET}) and option ({self.call_option_symbol}, {self.put_option_symbol}) data streams.")
-
     async def run(self):
-        """The main entry point for the MarketDataManager task."""
-        self.subscribe_to_streams()
-        logger.info("Market data manager running.")
+        """The main entry point for the PollingMarketDataManager task."""
+        self._running = True
+        logger.info("Polling market data manager starting...")
         
-        try:
-            # Use connection manager to start streams with proper rate limiting
-            option_task = await self.connection_manager.start_connection(
-                "option_stream", 
-                self.option_stream._run_forever()
-            )
-            
-            stock_task = await self.connection_manager.start_connection(
-                "stock_stream",
-                self.stock_stream._run_forever()
-            )
-            
-            # Wait for all connections to complete
-            tasks = self.connection_manager.get_active_connections()
-            if tasks:
-                await asyncio.gather(*tasks)
+        while self._running:
+            try:
+                # Poll both stock and option data
+                await asyncio.gather(
+                    self._poll_stock_data(),
+                    self._poll_option_data(),
+                    return_exceptions=True
+                )
                 
-        except Exception as e:
-            logger.error(f"Error in market data streams: {e}")
-            raise
-        finally:
-            await self.connection_manager.cleanup()
+                # Wait for the next poll interval
+                await asyncio.sleep(self.poll_interval)
+                
+            except Exception as e:
+                logger.error(f"Error in polling loop: {e}")
+                await asyncio.sleep(self.poll_interval)
+
+    def stop(self):
+        """Stop the polling loop."""
+        self._running = False
+        logger.info("Polling market data manager stopping...")

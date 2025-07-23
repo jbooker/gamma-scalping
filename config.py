@@ -16,7 +16,7 @@ API_SECRET = os.getenv("TRADING_API_SECRET")
 # --- Strategy & Ticker Configuration ---
 # The underlying asset for the gamma scalping strategy.
 # This is the stock or ETF you want to trade.
-HEDGING_ASSET = "NVDA"
+HEDGING_ASSET = "TSLA"
 # The directory where trade execution logs will be stored.
 TRADE_LOG_DIR = "trades"
 # --- Initialization Mode ---
@@ -24,7 +24,7 @@ TRADE_LOG_DIR = "trades"
 #         and its options, then establish a new straddle to start fresh.
 # 'resume': The application will assume a straddle is already in place and will
 #           sync with the existing positions to begin hedging immediately.
-INITIALIZATION_MODE = "resume"
+INITIALIZATION_MODE = "init"
 
 
 # --- Hedging Strategy Parameters ---

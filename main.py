@@ -2,10 +2,13 @@ import asyncio
 import logging
 import config
 import os
+import sys
+import argparse
 
 # Import the core components of the application. Each component is designed
 # to run as an independent, asynchronous task.
-from market.state import MarketDataManager
+from market.polling_data_manager import PollingMarketDataManager
+from market.schedule_monitor import MarketScheduleMonitor
 from engine.delta_engine import DeltaEngine
 from portfolio.position_manager import PositionManager
 from strategy.hedging_strategy import TradingStrategy
@@ -23,9 +26,36 @@ try:
 except ImportError:
     pass
 
-async def main():
+def parse_arguments():
+    """Parse command line arguments for initialization mode."""
+    parser = argparse.ArgumentParser(description='Gamma Scalping Trading Bot')
+    parser.add_argument(
+        '--mode', 
+        choices=['init', 'resume'], 
+        default=config.INITIALIZATION_MODE,
+        help='Initialization mode: init (liquidate and create new positions) or resume (use existing positions)'
+    )
+    parser.add_argument(
+        '--ticker',
+        type=str,
+        default=config.HEDGING_ASSET,
+        help=f'Override the ticker symbol for hedging asset (default: {config.HEDGING_ASSET})'
+    )
+    parser.add_argument(
+        '--liquidate-before-close',
+        action='store_true',
+        help='Liquidate all positions before market close (default: False)'
+    )
+    return parser.parse_args()
+
+async def main(initialization_mode=None, ticker=None, liquidate_before_close=False):
     """
     The main orchestration function for the Gamma Scalper application.
+
+    Args:
+        initialization_mode (str): Override for the initialization mode ('init' or 'resume')
+        ticker (str): Override for the ticker symbol to trade
+        liquidate_before_close (bool): Whether to liquidate positions before market close
 
     This function is responsible for:
     1. Initializing all the major components (PositionManager, MarketDataManager, etc.).
@@ -33,7 +63,18 @@ async def main():
     3. Performing the initial setup of the trading position (either 'init' or 'resume').
     4. Creating and running the main asynchronous tasks for each component.
     5. Handling graceful shutdown on user interruption (Ctrl+C).
+    6. Monitoring market schedule and shutting down before market close.
     """
+    # Use provided mode or fall back to config
+    mode = initialization_mode or config.INITIALIZATION_MODE
+    hedging_asset = ticker or config.HEDGING_ASSET
+    
+    logger.info(f"Starting in '{mode}' mode for ticker '{hedging_asset}'")
+    if liquidate_before_close:
+        logger.info("💸 Automatic liquidation before market close: ENABLED")
+    else:
+        logger.info("🔒 Automatic liquidation before market close: DISABLED")
+    
     # An asyncio.Event to signal a graceful shutdown to all concurrent tasks.
     shutdown_event = asyncio.Event()
 
@@ -56,7 +97,7 @@ async def main():
     # facilitate communication and coordination.
 
     # The PositionManager is the execution layer, handling all interactions with the Alpaca API.
-    position_manager = PositionManager(trade_action_queue, shutdown_event)
+    position_manager = PositionManager(trade_action_queue, shutdown_event, mode, hedging_asset)
 
     # --- Perform one-time setup based on the configured INITIALIZATION_MODE ---
     await position_manager.initialize_position()
@@ -69,7 +110,7 @@ async def main():
     await asyncio.sleep(5)  # Wait for the listener to subscribe to trade updates.
 
     # If in 'init' mode, the application finds and opens a new straddle position.
-    if config.INITIALIZATION_MODE == 'init':
+    if mode == 'init':
         await open_initial_straddle(position_manager)
 
     # A critical check: if we don't have a call and put option after initialization,
@@ -81,12 +122,13 @@ async def main():
 
     logger.info("Initializing application components...")
 
-    # The MarketDataManager subscribes to real-time market data for the underlying
-    # and the selected options, feeding price updates into the system.
-    market_manager = MarketDataManager(
+    # The PollingMarketDataManager subscribes to real-time market data for the underlying
+    # and the selected options, feeding price updates into the system via polling.
+    market_manager = PollingMarketDataManager(
         trigger_queue,
         position_manager.call_option_symbol,
-        position_manager.put_option_symbol
+        position_manager.put_option_symbol,
+        hedging_asset
     )
 
     # The DeltaEngine is the computational core, calculating the options delta
@@ -97,6 +139,11 @@ async def main():
     # and decides when to send a hedging trade command to the PositionManager.
     trading_strategy = TradingStrategy(position_manager, delta_queue, trade_action_queue, shutdown_event)
 
+    # The MarketScheduleMonitor handles automatic shutdown before market close
+    # and optional position liquidation.
+    market_monitor = MarketScheduleMonitor(shutdown_event, liquidate_before_close)
+    market_monitor.set_position_manager(position_manager)
+
     # --- Create and Run Concurrent Tasks ---
     # Each component's main logic is encapsulated in a 'run' method or similar
     # async loop. We gather them all into a list of tasks to be run by asyncio.
@@ -105,6 +152,7 @@ async def main():
         position_manager.trade_executor_loop(),
         delta_engine.run(),
         trading_strategy.run(),
+        market_monitor.run(),
         fill_listener_task  
     ]
 
@@ -126,6 +174,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    args = parse_arguments()
+    
     # The entry point of the script. asyncio.run() starts the event loop
     # and runs the main() coroutine until it completes.
-    asyncio.run(main())
+    asyncio.run(main(args.mode, args.ticker, args.liquidate_before_close))

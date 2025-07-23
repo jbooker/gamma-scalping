@@ -27,6 +27,7 @@ import random
 import time
 import logging
 import QuantLib as ql
+from typing import Any
 from datetime import datetime
 from typing import Tuple
 from market.state import MarketDataManager
@@ -196,7 +197,7 @@ class DeltaEngine:
     """
     def __init__(
         self,
-        market_manager: MarketDataManager,
+        market_manager: Any,  # Accept any market manager that has the required attributes
         trigger_queue: asyncio.Queue,
         delta_queue: asyncio.Queue,
         shutdown_event: asyncio.Event

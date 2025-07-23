@@ -71,24 +71,25 @@ async def open_initial_straddle(position_manager: PositionManager):
 
     # --- Step 1: Get the current price of the underlying asset. ---
     # The mid-price is used to get a fair estimate of the current market value.
+    hedging_asset = position_manager.hedging_asset
     try:
-        request_params = StockLatestQuoteRequest(symbol_or_symbols=HEDGING_ASSET)
+        request_params = StockLatestQuoteRequest(symbol_or_symbols=hedging_asset)
         latest_quote = stock_client.get_stock_latest_quote(request_params)
-        underlying_price = (latest_quote[HEDGING_ASSET].ask_price + latest_quote[HEDGING_ASSET].bid_price) / 2
-        logger.info(f"Current price of {HEDGING_ASSET} is ${underlying_price:.2f}")
+        underlying_price = (latest_quote[hedging_asset].ask_price + latest_quote[hedging_asset].bid_price) / 2
+        logger.info(f"Current price of {hedging_asset} is ${underlying_price:.2f}")
     except Exception as e:
-        logger.error(f"Failed to get current price for {HEDGING_ASSET}: {e}")
+        logger.error(f"Failed to get current price for {hedging_asset}: {e}")
         return
     
     # --- Step 2: Fetch all active option contracts within our criteria. ---
     logger.info(f"Fetching options expiring between {MIN_EXPIRATION_DAYS} and {MAX_EXPIRATION_DAYS} days.")
     # Set up the parameters for the API request for option contracts.
     request_params = GetOptionContractsRequest(
-        underlying_symbols=[HEDGING_ASSET],
+        underlying_symbols=[hedging_asset],
         status=AssetStatus.ACTIVE,
         expiration_date_gte=(datetime.now() + timedelta(days=MIN_EXPIRATION_DAYS)).date(),
         expiration_date_lte=(datetime.now() + timedelta(days=MAX_EXPIRATION_DAYS)).date(),
-        root_symbol=HEDGING_ASSET,
+        root_symbol=hedging_asset,
         type=ContractType.CALL
     )
     # Fetch all eligible call contracts.

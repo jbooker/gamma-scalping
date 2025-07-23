@@ -16,6 +16,7 @@ This class is the execution layer of the trading bot. It is responsible for:
     preventing race conditions and duplicate orders.
 """
 
+from typing import Optional
 import asyncio
 import time
 import logging
@@ -42,7 +43,9 @@ class PositionManager:
     def __init__(
         self,
         trade_action_queue: asyncio.Queue,
-        shutdown_event: asyncio.Event
+        shutdown_event: asyncio.Event,
+        initialization_mode: Optional[str] = None,
+        hedging_asset: Optional[str] = None
     ):
         """
         Initializes the PositionManager.
@@ -50,10 +53,18 @@ class PositionManager:
         Args:
             trade_action_queue: The input queue for receiving trade commands from the strategy.
             shutdown_event: The event to signal graceful shutdown.
+            initialization_mode: Override for initialization mode ('init' or 'resume').
+                                If None, uses the config value.
+            hedging_asset: Override for the ticker symbol to hedge.
+                          If None, uses the config value.
         """
         self.trade_action_queue = trade_action_queue
         self.shutdown_event = shutdown_event
+        self.initialization_mode = initialization_mode or INITIALIZATION_MODE
+        self.hedging_asset = hedging_asset or HEDGING_ASSET
         self.trading_client = TradingClientSigned(API_KEY, API_SECRET, paper=IS_PAPER_TRADING)
+        if not isinstance(API_KEY, str) or not API_KEY or not isinstance(API_SECRET, str) or not API_SECRET:
+            raise ValueError("API_KEY and API_SECRET must be non-empty strings.")
         self.trade_stream = TradingStream(API_KEY, API_SECRET, paper=IS_PAPER_TRADING)
         
         # --- Critical State ---
@@ -94,7 +105,7 @@ class PositionManager:
         Initializes the position based on the configured mode. This is one of the
         first actions taken when the application starts.
         """
-        logger.info(f"Initializing in '{INITIALIZATION_MODE}' mode.")
+        logger.info(f"Initializing in '{self.initialization_mode}' mode.")
 
         # Always cancel any lingering open orders to ensure a clean start.
         try:
@@ -104,10 +115,10 @@ class PositionManager:
             logger.warning(f"Could not cancel open orders: {e}")
 
 
-        if INITIALIZATION_MODE == 'init':
+        if self.initialization_mode == 'init':
             # In 'init' mode, we liquidate everything to start from a known flat state.
             await self._close_all_positions()
-        elif INITIALIZATION_MODE == 'resume':
+        elif self.initialization_mode == 'resume':
             # In 'resume' mode, we synchronize with existing positions.
             await self._resume_position()
 
@@ -127,12 +138,12 @@ class PositionManager:
                 # If it's an option, parse the symbol to check the underlying.
                 if pos.asset_class == AssetClass.US_OPTION:
                     underlying, _, _, _ = parse_option_symbol(pos.symbol)
-                    if underlying == HEDGING_ASSET:
+                    if underlying == self.hedging_asset:
                         self.trading_client.close_position(pos.symbol)
                         closed_positions.append(pos.symbol)
                 # If it's a stock, check if it's our hedging asset.
                 elif pos.asset_class == AssetClass.US_EQUITY:
-                    if pos.symbol == HEDGING_ASSET:
+                    if pos.symbol == self.hedging_asset:
                         self.trading_client.close_position(pos.symbol)
                         closed_positions.append(pos.symbol) 
 
@@ -150,7 +161,7 @@ class PositionManager:
         The handler for 'resume' mode. Queries Alpaca for existing positions and
         performs validation to ensure the state is suitable for the strategy to take over.
         """
-        logger.info(f"Resuming positions for {HEDGING_ASSET}...")
+        logger.info(f"Resuming positions for {self.hedging_asset}...")
         self.shares_owned = 0
 
         try:
@@ -158,9 +169,9 @@ class PositionManager:
 
             # First, find the stock position for the hedging asset.
             for pos in positions:
-                if pos.asset_class == AssetClass.US_EQUITY and pos.symbol == HEDGING_ASSET:
+                if pos.asset_class == AssetClass.US_EQUITY and pos.symbol == self.hedging_asset:
                     self.shares_owned = int(float(pos.qty))
-                    logger.info(f"Resumed stock position: {self.shares_owned} shares of {HEDGING_ASSET}.")
+                    logger.info(f"Resumed stock position: {self.shares_owned} shares of {self.hedging_asset}.")
                     break  # Found it, no need to continue looping.
 
             # Now, find all option positions for the underlying asset.
@@ -168,7 +179,7 @@ class PositionManager:
             for pos in positions:
                 if pos.asset_class == AssetClass.US_OPTION:
                     underlying, option_type, _, _ = parse_option_symbol(pos.symbol)
-                    if underlying == HEDGING_ASSET:
+                    if underlying == self.hedging_asset:
                         option_positions.append((pos.symbol, option_type, int(float(pos.qty))))
 
             if not option_positions:
@@ -181,7 +192,7 @@ class PositionManager:
 
             if len(calls) != 1 or len(puts) != 1:
                 raise ValueError(
-                    f"Expected exactly 1 call and 1 put for {HEDGING_ASSET}, "
+                    f"Expected exactly 1 call and 1 put for {self.hedging_asset}, "
                     f"but found {len(calls)} calls and {len(puts)} puts."
                 )
 
@@ -228,7 +239,7 @@ class PositionManager:
             fill_price = float(order.filled_avg_price)
 
             # --- Only process trades for the hedging asset ---
-            if data.order.symbol != HEDGING_ASSET:
+            if data.order.symbol != self.hedging_asset:
                 # This is likely an option trade from initialization.
                 # We log it but don't use it to update hedging state.
                 logger.info(f"Received fill for non-hedging asset {data.order.symbol}. Logging and ignoring for state.")
@@ -324,7 +335,7 @@ class PositionManager:
         """Submits a single trade and handles immediate errors."""
         try:
             order_request = MarketOrderRequest(
-                symbol=HEDGING_ASSET,
+                symbol=self.hedging_asset,
                 qty=abs(quantity),
                 side=side,
                 time_in_force=TimeInForce.DAY
@@ -332,7 +343,7 @@ class PositionManager:
             self.trading_client.submit_order(order_data=order_request)
             # Update our pending state immediately upon submission.
             self.pending_shares_change += quantity
-            logger.info(f"Submitted market order to {side.value} {abs(quantity)} {HEDGING_ASSET}. Pending change: {self.pending_shares_change}")
+            logger.info(f"Submitted market order to {side.value} {abs(quantity)} {self.hedging_asset}. Pending change: {self.pending_shares_change}")
         except Exception as e:
             logger.error(f"Error submitting order: {e}")
             # If the trade fails, release the lock so the bot doesn't get stuck.
